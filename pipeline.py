@@ -1,8 +1,8 @@
-import re
 import sys
 import time
 
 import requests
+import zipcodes
 from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.styles import Font
@@ -10,36 +10,72 @@ from openpyxl.utils import get_column_letter
 import os
 
 
-# ---------------------------------------------------------------------------
-# Validates that the given string is a 5-digit US ZIP code.
-# ---------------------------------------------------------------------------
-def validate_zip_code(zip_code):
-    return bool(re.fullmatch(r"\d{5}", zip_code.strip()))
+# All 50 US states + DC, mapping names and abbreviations for flexible input.
+US_STATES = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE",
+    "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ",
+    "new mexico": "NM", "new york": "NY", "north carolina": "NC",
+    "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR",
+    "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+    "district of columbia": "DC",
+}
+
+# Reverse lookup: abbreviation -> full name
+ABBR_TO_NAME = {v: k.title() for k, v in US_STATES.items()}
 
 
 # ---------------------------------------------------------------------------
-# Converts a US ZIP code to (latitude, longitude) via the Google Geocoding API.
-# Returns None if the ZIP code cannot be geocoded.
+# Validates a state name or abbreviation. Returns (full_name, abbreviation)
+# or None if the input is not a recognized US state.
 # ---------------------------------------------------------------------------
-def get_zip_coordinates(zip_code, api_key):
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {"address": zip_code, "key": api_key}
+def validate_state(state_input):
+    cleaned = state_input.strip().lower()
 
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+    # Check if it's a full state name
+    if cleaned in US_STATES:
+        abbr = US_STATES[cleaned]
+        return (cleaned.title(), abbr)
 
-        if data["status"] != "OK":
-            print(f"[ERROR] Geocoding failed for ZIP {zip_code}: {data['status']}")
-            return None
+    # Check if it's a 2-letter abbreviation
+    upper = cleaned.upper()
+    if upper in ABBR_TO_NAME:
+        return (ABBR_TO_NAME[upper], upper)
 
-        location = data["results"][0]["geometry"]["location"]
-        return (location["lat"], location["lng"])
+    return None
 
-    except requests.RequestException as e:
-        print(f"[ERROR] Geocoding request error: {e}")
-        return None
+
+# ---------------------------------------------------------------------------
+# Returns all ZIP codes for a state with valid coordinates.
+# Uses the zipcodes library (offline local database, no API calls).
+# Returns a list of (zip_code, lat, lng) tuples.
+# ---------------------------------------------------------------------------
+def get_state_zip_codes(state_abbr):
+    all_zips = zipcodes.filter_by(state=state_abbr, zip_code_type="STANDARD")
+    result = []
+    for z in all_zips:
+        if not z.get("active"):
+            continue
+        lat_str = z.get("lat", "0.0000")
+        lng_str = z.get("long", "0.0000")
+        try:
+            lat = float(lat_str)
+            lng = float(lng_str)
+        except (ValueError, TypeError):
+            continue
+        # Skip entries with zero/missing coordinates
+        if lat == 0.0 and lng == 0.0:
+            continue
+        result.append((z["zip_code"], lat, lng))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -65,14 +101,10 @@ def search_nearby_places(lat, lng, search_term, api_key):
             data = response.json()
 
             if data["status"] not in ("OK", "ZERO_RESULTS"):
-                print(
-                    f"[ERROR] Nearby Search failed for '{search_term}': {data['status']}"
-                )
                 break
 
             all_results.extend(data.get("results", []))
 
-            # Google provides next_page_token when more results are available
             next_token = data.get("next_page_token")
             if not next_token:
                 break
@@ -81,11 +113,9 @@ def search_nearby_places(lat, lng, search_term, api_key):
             time.sleep(2)
             params = {"pagetoken": next_token, "key": api_key}
 
-        print(f"  Found {len(all_results)} results for '{search_term}'")
         return all_results
 
-    except requests.RequestException as e:
-        print(f"[ERROR] Nearby Search request error: {e}")
+    except requests.RequestException:
         return all_results
 
 
@@ -109,18 +139,16 @@ def get_place_details(place_id, api_key):
         data = response.json()
 
         if data["status"] != "OK":
-            print(f"[ERROR] Place Details failed for {place_id}: {data['status']}")
             return None
 
         return data.get("result")
 
-    except requests.RequestException as e:
-        print(f"[ERROR] Place Details request error: {e}")
+    except requests.RequestException:
         return None
 
 
 # ---------------------------------------------------------------------------
-# Removes duplicate places based on place_id.
+# Removes duplicate places based on place_id. Returns the deduplicated list.
 # ---------------------------------------------------------------------------
 def deduplicate_places(places_list):
     seen = set()
@@ -131,17 +159,6 @@ def deduplicate_places(places_list):
             seen.add(pid)
             unique.append(place)
     return unique
-
-
-# ---------------------------------------------------------------------------
-# Keeps only businesses whose formatted_address contains the target ZIP code.
-# ---------------------------------------------------------------------------
-def filter_by_zip(places_list, target_zip):
-    return [
-        p
-        for p in places_list
-        if target_zip in p.get("formatted_address", "")
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -167,9 +184,10 @@ def _extract_state(components):
 
 # ---------------------------------------------------------------------------
 # Builds a flat record dictionary from a place details response.
+# source_zip tracks which ZIP code search discovered this business.
 # Missing fields default to an empty string.
 # ---------------------------------------------------------------------------
-def build_record(place_details, search_term, input_zip):
+def build_record(place_details, search_term, source_zip):
     if not place_details:
         return None
 
@@ -180,20 +198,13 @@ def build_record(place_details, search_term, input_zip):
     periods_text = opening_hours.get("weekday_text", [])
 
     # Map each day name to its hours string from weekday_text
-    # weekday_text looks like ["Monday: 9:00 AM – 6:00 PM", ...]
     day_hours = {
-        "Monday": "",
-        "Tuesday": "",
-        "Wednesday": "",
-        "Thursday": "",
-        "Friday": "",
-        "Saturday": "",
-        "Sunday": "",
+        "Monday": "", "Tuesday": "", "Wednesday": "", "Thursday": "",
+        "Friday": "", "Saturday": "", "Sunday": "",
     }
     for entry in periods_text:
         for day in day_hours:
             if entry.startswith(day):
-                # Everything after "Day: " is the hours portion
                 day_hours[day] = entry.split(": ", 1)[1] if ": " in entry else entry
 
     types_list = place_details.get("types", [])
@@ -228,7 +239,7 @@ def build_record(place_details, search_term, input_zip):
         "hours_saturday": day_hours["Saturday"],
         "hours_sunday": day_hours["Sunday"],
         "search_term": search_term,
-        "input_zip_code": input_zip,
+        "source_zip": source_zip,
     }
 
 
@@ -236,8 +247,8 @@ def build_record(place_details, search_term, input_zip):
 # Saves a list of record dictionaries to a formatted Excel file.
 # Returns the filename that was saved.
 # ---------------------------------------------------------------------------
-def save_to_excel(records, zip_code):
-    filename = f"pet_stores_{zip_code}.xlsx"
+def save_to_excel(records, state_abbr):
+    filename = f"pet_stores_{state_abbr}.xlsx"
 
     try:
         wb = Workbook()
@@ -250,25 +261,23 @@ def save_to_excel(records, zip_code):
 
         headers = list(records[0].keys())
 
-        # Write bold header row
         bold_font = Font(bold=True)
         for col_idx, header in enumerate(headers, start=1):
             cell = ws.cell(row=1, column=col_idx, value=header)
             cell.font = bold_font
 
-        # Write data rows
         for row_idx, record in enumerate(records, start=2):
             for col_idx, header in enumerate(headers, start=1):
                 ws.cell(row=row_idx, column=col_idx, value=record.get(header, ""))
 
-        # Auto-size columns based on content width
+        # Auto-size columns based on content width (capped at 50)
         for col_idx, header in enumerate(headers, start=1):
             max_length = len(str(header))
             for row_idx in range(2, len(records) + 2):
                 cell_value = ws.cell(row=row_idx, column=col_idx).value
                 if cell_value is not None:
                     max_length = max(max_length, len(str(cell_value)))
-            adjusted_width = min(max_length + 2, 50)  # cap at 50 to stay readable
+            adjusted_width = min(max_length + 2, 50)
             ws.column_dimensions[get_column_letter(col_idx)].width = adjusted_width
 
         wb.save(filename)
@@ -281,15 +290,19 @@ def save_to_excel(records, zip_code):
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline: ties all the steps together.
+# Main pipeline: searches every ZIP code in a state for pet businesses.
 # ---------------------------------------------------------------------------
 def main():
-    # Step 1 — Get ZIP code from user
-    zip_code = input("Enter ZIP code: ").strip()
+    # Step 1 — Get state from user
+    state_input = input("Enter state name or abbreviation: ").strip()
 
-    if not validate_zip_code(zip_code):
-        print("[ERROR] Invalid ZIP code. Please enter a valid 5-digit US ZIP code.")
+    state_info = validate_state(state_input)
+    if state_info is None:
+        print("[ERROR] Invalid state. Please enter a US state name or 2-letter abbreviation.")
         sys.exit(1)
+
+    state_name, state_abbr = state_info
+    print(f"\nState: {state_name} ({state_abbr})")
 
     # Step 2 — Load API key from .env
     load_dotenv()
@@ -299,77 +312,88 @@ def main():
         print("[ERROR] GOOGLE_PLACES_API_KEY not found in .env file.")
         sys.exit(1)
 
-    # Step 3 — Convert ZIP to coordinates
-    print(f"\nGeocoding ZIP code {zip_code}...")
-    coords = get_zip_coordinates(zip_code, api_key)
+    # Step 3 — Get all ZIP codes for the state (local database, no API calls)
+    zip_codes = get_state_zip_codes(state_abbr)
 
-    if coords is None:
-        print("[ERROR] Could not geocode the ZIP code. Exiting.")
+    if not zip_codes:
+        print(f"[ERROR] No ZIP codes found for {state_name}.")
         sys.exit(1)
 
-    lat, lng = coords
-    print(f"  Coordinates: {lat}, {lng}")
+    print(f"Found {len(zip_codes)} ZIP codes with valid coordinates")
 
-    # Step 4 — Search for businesses using 3 search terms
+    # Step 4 — Search every ZIP code with 3 search terms
     search_terms = ["pet store", "pet supplies", "pet shop"]
     all_raw_results = []
+    # Track which ZIP each raw result came from
+    result_source_zips = {}
+    total_zips = len(zip_codes)
 
-    print("\nSearching for pet businesses...")
-    for term in search_terms:
-        results = search_nearby_places(lat, lng, term, api_key)
-        all_raw_results.extend(results)
+    print(f"\nSearching {total_zips} ZIP codes (3 search terms each)...\n")
+
+    for zip_idx, (zip_code, lat, lng) in enumerate(zip_codes, start=1):
+        zip_count = 0
+        for term in search_terms:
+            results = search_nearby_places(lat, lng, term, api_key)
+            for r in results:
+                pid = r.get("place_id")
+                if pid and pid not in result_source_zips:
+                    result_source_zips[pid] = zip_code
+            zip_count += len(results)
+            all_raw_results.extend(results)
+            # Small delay between API calls to avoid rate limiting
+            time.sleep(0.1)
+
+        print(f"  [{zip_idx}/{total_zips}] ZIP {zip_code} — {zip_count} results")
 
     raw_count = len(all_raw_results)
     print(f"\nTotal raw results: {raw_count}")
 
     if raw_count == 0:
-        print("[INFO] No businesses found. Exiting.")
+        print(f"[INFO] No pet businesses found in {state_name}. Exiting.")
         sys.exit(0)
 
-    # Step 5 — Deduplicate by place_id
+    # Step 5 — Deduplicate across all ZIP code searches
     unique_places = deduplicate_places(all_raw_results)
     dedup_count = len(unique_places)
     print(f"After deduplication: {dedup_count}")
 
     # Step 6 — Get full details for each unique place
-    print("\nFetching place details...")
+    print(f"\nFetching details for {dedup_count} unique businesses...\n")
     detailed_places = []
     for i, place in enumerate(unique_places, start=1):
         pid = place.get("place_id")
-        print(f"  [{i}/{dedup_count}] {place.get('name', 'Unknown')}")
+        name = place.get("name", "Unknown")
+        print(f"  [{i}/{dedup_count}] {name}")
         details = get_place_details(pid, api_key)
         if details:
+            # Attach the source ZIP that first found this place
+            details["_source_zip"] = result_source_zips.get(pid, "")
             detailed_places.append(details)
+        time.sleep(0.1)
 
-    # Step 7 — Filter to keep only businesses in the target ZIP
-    filtered = filter_by_zip(detailed_places, zip_code)
-    filtered_count = len(filtered)
-    print(f"\nAfter ZIP code filtering: {filtered_count}")
-
-    if filtered_count == 0:
-        print(f"[INFO] No businesses found in ZIP code {zip_code}. Exiting.")
-        sys.exit(0)
-
-    # Step 8 — Build clean records
+    # Step 7 — Build clean records
     records = []
-    for details in filtered:
-        # Use the first matching search term found in the place's types/name
-        # Default to the first search term
-        matched_term = search_terms[0]
-        record = build_record(details, matched_term, zip_code)
+    for details in detailed_places:
+        source_zip = details.pop("_source_zip", "")
+        record = build_record(details, "pet store", source_zip)
         if record:
             records.append(record)
 
-    # Step 9 — Save to Excel
-    filename = save_to_excel(records, zip_code)
+    if not records:
+        print(f"[INFO] No records could be built for {state_name}. Exiting.")
+        sys.exit(0)
 
-    # Step 10 — Print summary
+    # Step 8 — Save to Excel
+    filename = save_to_excel(records, state_abbr)
+
+    # Step 9 — Print summary
     print("\n" + "=" * 50)
     print("PIPELINE SUMMARY")
     print("=" * 50)
-    print(f"  Raw results found:        {raw_count}")
-    print(f"  After deduplication:       {dedup_count}")
-    print(f"  After ZIP filtering:       {filtered_count}")
+    print(f"  State:                     {state_name} ({state_abbr})")
+    print(f"  ZIP codes searched:        {total_zips}")
+    print(f"  Raw results found:         {raw_count}")
+    print(f"  After deduplication:        {dedup_count}")
     print(f"  Records saved:             {len(records)}")
     if filename:
         print(f"  Output file:               {filename}")
