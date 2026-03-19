@@ -53,7 +53,6 @@ def search_nearby_places(lat, lng, search_term, api_key):
         "location": f"{lat},{lng}",
         "radius": 5000,
         "keyword": search_term,
-        "type": "pet_store",
         "key": api_key,
     }
 
